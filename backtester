@@ -1,5 +1,25 @@
+from pandas_datareader import data as pdr
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pandas_datareader import data as pdr
+
+# -----------------------------------------
+# 1. Settings and Data Retrieval
+# -----------------------------------------
+start_date = '1968-01-01'
+end_date   = '2025-01-01'
+trading_days = 252  # trading days per year
+
+# Retrieve S&P 500 data from Yahoo Finance
+sp500 = yf.download("^GSPC", start=start_date, end=end_date)['Adj Close']
+sp500 = sp500.sort_index().ffill()  # forward-fill missing values
+sp500_ret = sp500.pct_change().dropna()
+
+# Retrieve FRED data for DTB3 (3‑month T‑Bill yield) and DGS5 (5‑year Treasury yield)
+dtb3 = pdr.DataReader('DTB3', 'fred', start_date, end_date).ffill()
+dgs5 = pdr.DataReader('DGS5', 'fred', start_date, end_date).ffill()
+
+# TODO, Load Gold Data, Combine Data, Simulate the Underlying Returns for Each “Ticker”, Build the Strategie, Compute Performance Metrics (CAGR and Maximum Drawdown)
+
