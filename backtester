@@ -1,4 +1,3 @@
-from pandas_datareader import data as pdr
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -13,13 +12,150 @@ end_date   = '2025-01-01'
 trading_days = 252  # trading days per year
 
 # Retrieve S&P 500 data from Yahoo Finance
-sp500 = yf.download("^GSPC", start=start_date, end=end_date)['Adj Close']
-sp500 = sp500.sort_index().ffill()  # forward-fill missing values
-sp500_ret = sp500.pct_change().dropna()
+sp500 = yf.download("^GSPC", start=start_date, end=end_date, auto_adjust=True)[['Close']].squeeze()
+sp500 = sp500.sort_index().ffill()
 
-# Retrieve FRED data for DTB3 (3‑month T‑Bill yield) and DGS5 (5‑year Treasury yield)
+# Compute daily returns
+sp500_ret = sp500.pct_change().dropna()
+sp500_ret.name = 'SP500_ret'  # give it the correct name here
+
+# Retrieve FRED data for DTB3 (3-month T-Bill yield) and DGS5 (5-year Treasury yield)
 dtb3 = pdr.DataReader('DTB3', 'fred', start_date, end_date).ffill()
 dgs5 = pdr.DataReader('DGS5', 'fred', start_date, end_date).ffill()
 
-# TODO, Load Gold Data, Combine Data, Simulate the Underlying Returns for Each “Ticker”, Build the Strategie, Compute Performance Metrics (CAGR and Maximum Drawdown)
+# -----------------------------------------
+# 2. Load Gold Data from Your Kaggle Dataset
+# -----------------------------------------
+# Assume the Kaggle file is named 'gold_prices.csv' and includes columns "Date" and "USD".
+gold = pd.read_csv('gold_prices.csv', parse_dates=['Date'], usecols=['Date', 'USD'])
+gold = gold.set_index('Date')
+# Remove any commas from the USD values and convert them to numeric.
+gold['USD'] = pd.to_numeric(gold['USD'].str.replace(',', ''), errors='coerce')
+gold = gold.dropna(subset=['USD'])
+gold = gold.rename(columns={'USD': 'GOLD'})
+gold = gold.sort_index().ffill()
 
+# -----------------------------------------
+# 3. Combine Data into a Single DataFrame
+# -----------------------------------------
+fred_data = pd.concat([dtb3, dgs5, gold], axis=1)
+fred_data.columns = ['DTB3', 'DGS5', 'GOLD']
+fred_data = fred_data.dropna()
+
+# Merge S&P 500 returns with the combined FRED/Gold data (using an inner join).
+data = pd.concat([sp500_ret, fred_data], axis=1, join='inner').dropna()
+
+# -----------------------------------------
+# 4. Simulate the Underlying Returns for Each “Ticker”
+# -----------------------------------------
+# For the dynamic strategy, simulate UPRO as 3× leveraged S&P 500.
+data['UPRO_ret'] = 3 * data['SP500_ret']
+
+# For the static strategy, assume SSO is 2× leveraged S&P 500.
+data['SSO_ret'] = 2 * data['SP500_ret']
+
+# T-Bill return: approximate the daily return from the 3-month T-Bill yield.
+data['TB_ret'] = (data['DTB3'] / 100) / trading_days
+
+# Simulate ZROZ (a constant-maturity 5-year zero coupon bond) daily return using a duration approximation:
+#   r_ZROZ(t) ≈ (y_t/100)/252 - 5 * ((y_{t+1} - y_t)/100)/252
+data['ZROZ_ret'] = (data['DGS5'] / 100) / trading_days - 5 * ((data['DGS5'].shift(-1) - data['DGS5']) / 100) / trading_days
+
+# For gold, compute the daily return from the gold price.
+data['GLD_ret'] = data['GOLD'].pct_change()
+
+# Drop rows with missing values due to shifting or percentage change.
+data = data.dropna(subset=['ZROZ_ret', 'GLD_ret'])
+
+# -----------------------------------------
+# 5. Build the Strategies
+# -----------------------------------------
+
+# --- Dynamic Strategy: UPRO vs. T-Bills ---
+# Compute the cumulative return for UPRO.
+data['UPRO_cum'] = (1 + data['UPRO_ret']).cumprod()
+# Compute the 200-day moving average of UPRO's cumulative return.
+data['UPRO_MA200'] = data['UPRO_cum'].rolling(window=200).mean()
+# Generate a signal: invest in UPRO (signal = 1) if UPRO's cumulative return is above its 200-day MA; otherwise, invest in T-Bills (signal = 0).
+data['signal'] = (data['UPRO_cum'] > data['UPRO_MA200']).astype(int)
+# Shift the signal by one day to avoid look-ahead bias.
+data['signal_shifted'] = data['signal'].shift(1)
+# Compute the dynamic strategy's daily return:
+# When signal==1, use UPRO return; when signal==0, use T-Bill return.
+data['dyn_strat_ret'] = data['signal_shifted'] * data['UPRO_ret'] + (1 - data['signal_shifted']) * data['TB_ret']
+# Compute the cumulative return for the dynamic strategy.
+data['dyn_cum'] = (1 + data['dyn_strat_ret']).cumprod()
+
+# --- Static Strategy: Fixed 50/30/30 allocation among SSO, ZROZ, and Gold ---
+raw_weights = np.array([0.50, 0.30, 0.30])
+weights = raw_weights / raw_weights.sum()
+data['static_strat_ret'] = (weights[0] * data['SSO_ret'] +
+                            weights[1] * data['ZROZ_ret'] +
+                            weights[2] * data['GLD_ret'])
+data['static_cum'] = (1 + data['static_strat_ret']).cumprod()
+
+# -----------------------------------------
+# 6. Compute Performance Metrics (CAGR and Maximum Drawdown)
+# -----------------------------------------
+def performance_metrics(cum_returns, daily_returns):
+    n_days = len(daily_returns)
+    # CAGR = (ending value)^(trading_days/n_days) - 1
+    cagr = cum_returns.iloc[-1] ** (trading_days / n_days) - 1
+    running_max = cum_returns.cummax()
+    drawdown = (cum_returns / running_max) - 1
+    max_drawdown = drawdown.min()
+    return cagr, max_drawdown
+
+data_metrics = data.dropna()
+cagr_dyn, mdd_dyn = performance_metrics(data_metrics['dyn_cum'], data_metrics['dyn_strat_ret'])
+cagr_static, mdd_static = performance_metrics(data_metrics['static_cum'], data_metrics['static_strat_ret'])
+
+# --- Add S&P 500 benchmark ---
+sp500_prices = yf.download("^GSPC", start=start_date, end=end_date, auto_adjust=True)
+
+# get a 1-D Series of closes
+if isinstance(sp500_prices, pd.DataFrame):
+    if 'Close' in sp500_prices.columns:
+        sp500_prices = sp500_prices['Close']
+    else:
+        # if yfinance returns a multiindex or odd shape, fall back to first column
+        sp500_prices = sp500_prices.iloc[:, 0]
+sp500_prices = sp500_prices.sort_index().ffill()
+
+n_days_bench = (sp500_prices.index[-1] - sp500_prices.index[0]).days
+cagr_sp500 = float((sp500_prices.iloc[-1] / sp500_prices.iloc[0]) ** (365.0 / n_days_bench) - 1)
+
+running_max_bench = sp500_prices.cummax()
+drawdown_bench = (sp500_prices / running_max_bench) - 1
+max_drawdown_sp500 = float(drawdown_bench.min())
+
+# -----------------------------------------
+# 7. Display the Date Range and Performance Metrics
+# -----------------------------------------
+date_start = data_metrics.index.min().strftime('%Y-%m-%d')
+date_end = data_metrics.index.max().strftime('%Y-%m-%d')
+print(f"Backtest Date Range: {date_start} to {date_end}\n")
+print("Dynamic Strategy (UPRO vs. T-Bills) Performance:")
+print(f"  CAGR:         {cagr_dyn:.2%}")
+print(f"  Max Drawdown: {mdd_dyn:.2%}\n")
+print("Static Strategy (SSO, ZROZ, Gold 50/30/30) Performance:")
+print(f"  CAGR:         {cagr_static:.2%}")
+print(f"  Max Drawdown: {mdd_static:.2%}")
+
+print("S&P 500 Benchmark Performance:")
+print(f"  CAGR:         {cagr_sp500:.2%}")
+print(f"  Max Drawdown: {max_drawdown_sp500:.2%}\n")
+
+# -----------------------------------------
+# 8. Plot the Cumulative Returns (Growth of $1,000)
+# -----------------------------------------
+plt.figure(figsize=(12, 6))
+# Multiply cumulative returns by 1,000 to simulate the growth of a $1,000 investment.
+plt.plot(data_metrics.index, 1000 * data_metrics['dyn_cum'], label="Dynamic Strategy (UPRO vs. T-Bills)", lw=2)
+plt.plot(data_metrics.index, 1000 * data_metrics['static_cum'], label="Static Strategy (SSO, ZROZ, Gold 50/30/30)", lw=2)
+plt.xlabel("Date")
+plt.ylabel("Portfolio Value ($)")
+plt.title("Growth of $1,000 Over Time: Dynamic (UPRO vs. T-Bills) vs. Static Strategies")
+plt.legend()
+plt.grid(True)
+plt.show()
