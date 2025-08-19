@@ -11,6 +11,9 @@ A Python backtesting tool for manually backtesting asset certain portfolios and 
 
 In this case I was trying to find the effectiveness of gold one of my portfolios (SSO/ZROZ/GLD) and the CAGR. 
 
+Gold information was from kaggle dataset 
+https://www.kaggle.com/datasets/tunguz/gold-prices/data?select=monthly_csv.csv
+
 ## Requirements
 ```bash
 pip install yfinance pandas pandas_datareader matplotlib numpy
